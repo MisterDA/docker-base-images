@@ -4,8 +4,12 @@ module Switch_map = Map.Make(Ocaml_version)
 
 let weekly = Current_cache.Schedule.v ~valid_for:(Duration.of_day 7) ()
 
-let opam_repository () =
-  Current_git.clone ~schedule:weekly "git://github.com/ocaml/opam-repository"
+let opam_repository os_family =
+  let uri, gref =
+    let open Uri in
+    let uri = of_string (Dockerfile_distro.opam_repository os_family) in
+    with_fragment uri None |> to_string, fragment uri in
+  Current_git.clone ~schedule:weekly ?gref uri
   |> Current.map Current_git.Commit.id
 
 (* [aliases_of d] gives other tags which should point to [d].
@@ -16,27 +20,26 @@ let aliases_of =
 
 let master_distro = Dockerfile_distro.(resolve_alias master_distro)
 
-let maybe_add_beta switch =
-  let open Dockerfile in
+type 'a run = ('a, unit, string, Dockerfile.t) format4 -> 'a
+
+let maybe_add_beta (run : 'a run) switch =
   if Ocaml_version.Releases.is_dev switch then
     run "opam repo add beta git://github.com/ocaml/ocaml-beta-repository --set-default"
   else
-    empty
+    Dockerfile.empty
 
-let maybe_add_multicore switch =
-  let open Dockerfile in
+let maybe_add_multicore (run : 'a run) switch =
   if Ocaml_version.Configure_options.is_multicore switch then
     run "opam repo add multicore git://github.com/ocaml-multicore/multicore-opam --set-default"
   else
-    empty
+    Dockerfile.empty
 
-let maybe_install_secondary_compiler ~switch =
+let maybe_install_secondary_compiler (run : 'a run) switch =
   let dune_min_native_support = Ocaml_version.Releases.v4_08 in
-  let open Dockerfile in
   if Ocaml_version.compare switch dune_min_native_support < 0 then
     run "opam install -y ocaml-secondary-compiler"
   else
-    empty
+    Dockerfile.empty
 
 let install_package_archive opam_image =
   let open Dockerfile in
@@ -47,29 +50,49 @@ let install_package_archive opam_image =
   copy ~chown:"0:0" ~from:"archive" ~src:["/home/opam/opam-repository/cache"] ~dst:"/cache" ()
 
 (* Generate a Dockerfile to install OCaml compiler [switch] in [opam_image]. *)
-let install_compiler_df ~os_family ~arch ~switch opam_image =
-  let switch_name = Ocaml_version.to_string (Ocaml_version.with_just_major_and_minor switch) in
-  let (package_name, package_version) = Ocaml_version.Opam.V2.package switch in
+let install_compiler_df ~os_family ~arch ~switch ?windows_port opam_image =
+  let switch_name = Ocaml_version.(with_just_major_and_minor switch |> to_string) in
+  let (package_name, package_version) =
+    match windows_port with
+    | None -> Ocaml_version.Opam.V2.package switch
+    | Some port -> Dockerfile_windows.ocaml_for_windows_package_exn ~switch ~arch ~port
+  in
+  let open Dockerfile in
+  let run, run_no_opam, depext =
+    let open Dockerfile_windows in
+    let bitness = if Ocaml_version.arch_is_32bit arch then "--32" else "--64" in
+    match windows_port with
+    | None ->
+       (fun fmt -> run fmt), (fun fmt -> run fmt), "opam-depext"
+    | Some `Msvc ->
+       (fun fmt -> run_ocaml_env (bitness ^ " --ms=vs2019") fmt),
+       (fun fmt -> run_ocaml_env (bitness ^ " --ms=vs2019 --no-opam ") fmt),
+       "depext"
+    | Some `Mingw ->
+       (fun fmt -> run_ocaml_env bitness fmt),
+       (fun fmt -> run_ocaml_env (bitness ^ " --no-opam") fmt),
+       "depext depext-cygwinports"
+  in
   let additional_packages = Ocaml_version.Opam.V2.additional_packages switch in
   let personality = Dockerfile_distro.personality os_family arch in
-  let open Dockerfile in
   let shell = Option.fold ~none:empty ~some:(fun pers -> shell [pers; "/bin/sh"; "-c"]) personality in
+  let packages = String.concat "," (Printf.sprintf "%s.%s" package_name package_version :: additional_packages) in
   from opam_image @@
   shell @@
-  maybe_add_beta switch @@
-  maybe_add_multicore switch @@
+  maybe_add_beta run switch @@
+  maybe_add_multicore run switch @@
   env ["OPAMYES", "1";
        "OPAMDEPEXTYES", "1"; (* Remove this when https://github.com/ocaml/opam/pull/4563 is merged *)
        "OPAMUNSAFEDEPEXTYES", "1";
        "OPAMERRLOGLEN", "0"; (* Show the whole log if it fails *)
        "OPAMPRECISETRACKING", "1"; (* Mitigate https://github.com/ocaml/opam/issues/3997 *)
       ] @@
-  run "opam switch create %s --packages=%s" switch_name (String.concat "," (Printf.sprintf "%s.%s" package_name package_version :: additional_packages)) @@
+  run_no_opam "opam switch create %s --packages=%s" switch_name packages @@
+  run "opam install -y %s" depext @@
   run "opam pin add -k version %s %s" package_name package_version @@
-  run "opam install -y opam-depext" @@
-  maybe_install_secondary_compiler ~switch @@
+  maybe_install_secondary_compiler run switch @@
   entrypoint_exec (Option.to_list personality @ ["opam"; "exec"; "--"]) @@
-  cmd "bash" @@
+  match os_family with `Linux | `Cygwin -> cmd "bash" | `Windows -> cmd "CMD" @@
   copy ~src:["Dockerfile"] ~dst:"/Dockerfile.ocaml" ()
 
 let or_die = function
@@ -83,17 +106,28 @@ module Arch = struct
 
   let install_opam ~arch ~ocluster ~distro ~opam_repository ~push_target =
     let arch_name = Ocaml_version.string_of_arch arch in
+    let os_family = Dockerfile_distro.os_family_of_distro distro in
     let dockerfile =
       `Contents (
         let opam = snd @@ Dockerfile_opam.gen_opam2_distro ~arch ~clone_opam_repo:false distro in
         let open Dockerfile in
         string_of_t (
-          opam @@
-          copy ~chown:"opam:opam" ~src:["."] ~dst:"/home/opam/opam-repository" () @@
-          run "opam-sandbox-disable" @@
-          run "opam init -k local -a /home/opam/opam-repository --bare" @@
-          run "rm -rf .opam/repo/default/.git" @@
-          copy ~src:["Dockerfile"] ~dst:"/Dockerfile.opam" ()
+          opam
+          @@ begin match os_family with
+             | `Cygwin | `Linux ->
+                copy ~chown:"opam:opam" ~src:["."] ~dst:"/home/opam/opam-repository" ()
+                @@ run "opam-sandbox-disable"
+                @@ run "opam init -k local -a /home/opam/opam-repository --bare"
+                @@ run "rm -rf .opam/repo/default/.git"
+             | `Windows ->
+                let opam_repo = Dockerfile_windows.Cygwin.default.root ^ {|\home\opam\opam-repository|} in
+                let opam_root = {|C:\opam\.opam|} in
+                copy ~src:["."] ~dst:opam_repo ()
+                @@ env [("OPAMROOT", opam_root)]
+                @@ run "opam init -k local -a \"%s\" --bare --disable-sandboxing" opam_repo
+                @@ Dockerfile_windows.Cygwin.run_sh "rm -rf /cygdrive/c/opam/.opam/repo/default/.git"
+             end
+          @@ copy ~src:["Dockerfile"] ~dst:"/Dockerfile.opam" ()
         )
       )
     in
@@ -106,13 +140,13 @@ module Arch = struct
       ~cache_hint
       ~options
       ~push_target
-      ~pool:(Conf.pool_name (Dockerfile_distro.os_family_of_distro distro) arch)
+      ~pool:(Conf.pool_name os_family arch)
 
-  let install_compiler ~os_family ~arch ~ocluster ~switch ~push_target base =
+  let install_compiler ~os_family ~arch ~ocluster ~switch ~push_target ?windows_port base =
     let arch_name = Ocaml_version.string_of_arch arch in
     Current.component "%s/%s" (Ocaml_version.to_string switch) arch_name |>
     let> base = base in
-    let dockerfile = `Contents (install_compiler_df ~os_family ~arch ~switch base |> Dockerfile.string_of_t) in
+    let dockerfile = `Contents (install_compiler_df ~os_family ~arch ~switch ?windows_port base |> Dockerfile.string_of_t) in
     (* ([include_git] doesn't do anything here, but it saves rebuilding during the upgrade) *)
     let options = { Cluster_api.Docker.Spec.defaults with squash; include_git = true } in
     let cache_hint = Printf.sprintf "%s-%s-%s" (Ocaml_version.to_string switch) arch_name base in
@@ -152,7 +186,8 @@ module Arch = struct
         |> Cluster_api.Docker.Image_id.of_string
         |> or_die
       in
-      let repo_id = install_compiler ~os_family ~arch ~ocluster ~switch ~push_target opam_image in
+      let windows_port = match distro with  `Windows (port, _) -> Some port | _ -> None in
+      let repo_id = install_compiler ~os_family ~arch ~ocluster ~switch ~push_target ?windows_port opam_image in
       (switch, repo_id)
     in
     (* Build the archive image for the debian 10 / x86_64 image only *)
@@ -198,11 +233,11 @@ let label l t =
 
 (* The main pipeline. Builds images for all supported distribution, compiler version and architecture combinations. *)
 let v ?channel ~ocluster () =
-  let repo = opam_repository () in
   Current.all (
     Conf.distros |> List.map @@ fun distro ->
     let distro_label = Dockerfile_distro.tag_of_distro distro in
-    let repo = label distro_label repo in
+    let os_family = Dockerfile_distro.os_family_of_distro distro in
+    let repo = label distro_label (opam_repository os_family) in
     Current.collapse ~key:"distro" ~value:distro_label ~input:repo @@
     let distro_aliases = aliases_of distro in
     let arches = Conf.arches_for ~distro in

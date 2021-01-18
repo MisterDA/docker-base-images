@@ -25,4 +25,5 @@
   (capnp-rpc-unix (>= "0.7.0"))
   (dockerfile (>= "6.2.0"))
   (dockerfile-opam (>= "6.2.0"))
-  (ocaml-version (>= "2.6.1"))))
+  (ocaml-version (>= "2.6.1"))
+  (uri (>= "4.1"))))
