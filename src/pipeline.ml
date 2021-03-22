@@ -205,9 +205,8 @@ module Arch = struct
     (opam_image, compiler_images, archive_image)
 end
 
-module Switch_set = Set.Make(Ocaml_version)
-
 let all_switches arches =
+  let module Switch_set = Set.Make(Ocaml_version) in
   arches |> ListLabels.fold_left ~init:Switch_set.empty ~f:(fun acc map ->
       Switch_map.fold (fun k _v acc -> Switch_set.add k acc) map acc
     )
@@ -236,13 +235,14 @@ let v ?channel ~ocluster () =
   Current.all (
     Conf.distros |> List.map @@ fun distro ->
     let distro_label = Dockerfile_distro.tag_of_distro distro in
-    let os_family = Dockerfile_distro.os_family_of_distro distro in
-    let repo = label distro_label (opam_repository os_family) in
+    let repo =
+      let os_family = Dockerfile_distro.os_family_of_distro distro in
+      label distro_label (opam_repository os_family) in
     Current.collapse ~key:"distro" ~value:distro_label ~input:repo @@
-    let distro_aliases = aliases_of distro in
-    let arches = Conf.arches_for ~distro in
-    let arch_results = List.map (Arch.pipeline ~ocluster ~opam_repository:repo ~distro) arches in
     let opam_images, ocaml_images, archive_image =
+      let arch_results =
+        let arches = Conf.arches_for ~distro in
+        List.map (Arch.pipeline ~ocluster ~opam_repository:repo ~distro) arches in
       List.fold_left (fun (aa,ba,ca) (a,b,c) ->
         let ca = match ca,c with Some v, _ -> Some v | None, v -> v in
         a::aa, b::ba, ca) ([], [], None) arch_results in
@@ -253,6 +253,7 @@ let v ?channel ~ocluster () =
       else (
         let full_tag = Tag.v distro ~switch in
         let tags =
+          let distro_aliases = aliases_of distro in
           (* Push the image as e.g. debian-10-ocaml-4.09 and debian-ocaml-4.09 *)
           let tags = full_tag :: List.map (Tag.v ~switch) distro_aliases in
           if switch <> Ocaml_version.Releases.latest then tags
