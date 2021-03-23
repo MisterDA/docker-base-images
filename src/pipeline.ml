@@ -230,15 +230,12 @@ let label l t =
   let> v = t in
   Current.Primitive.const v
 
-(* The main pipeline. Builds images for all supported distribution, compiler version and architecture combinations. *)
-let v ?channel ~ocluster () =
-  Current.all (
-    Conf.distros |> List.map @@ fun distro ->
-    let distro_label = Dockerfile_distro.tag_of_distro distro in
-    let repo =
-      let os_family = Dockerfile_distro.os_family_of_distro distro in
-      label distro_label (opam_repository os_family) in
-    Current.collapse ~key:"distro" ~value:distro_label ~input:repo @@
+let linux_pipeline ~ocluster distro =
+  let distro_label = Dockerfile_distro.tag_of_distro distro in
+  let repo =
+    let os_family = Dockerfile_distro.os_family_of_distro distro in
+    label distro_label (opam_repository os_family) in
+  Current.collapse ~key:"distro" ~value:distro_label ~input:repo @@
     let opam_images, ocaml_images, archive_image =
       let arch_results =
         let arches = Conf.arches_for ~distro in
@@ -283,5 +280,97 @@ let v ?channel ~ocluster () =
      ("base", Current_docker.push_manifest ?auth:Conf.auth ~tag:(Tag.v distro) opam_images |> Current.ignore_value)
       :: ocaml_images
       @ archive_images)
-  )
+
+let windows_distro_pipeline ~ocluster repo distro_label distro_versions =
+  (* let multiarch_images = ref [] in *)
+  let distro_pipeline multiarches distro =
+    let opam_images, ocaml_images, archive_image =
+      let arch_results =
+        let arches = Conf.arches_for ~distro in
+        List.map (Arch.pipeline ~ocluster ~opam_repository:repo ~distro) arches in
+      List.fold_left (fun (aa,ba,ca) (a,b,c) ->
+        let ca = match ca,c with Some v, _ -> Some v | None, v -> v in
+        a::aa, b::ba, ca) ([], [], None) arch_results in
+    let (multiarch_images, ocaml_images) =
+      all_switches ocaml_images |> List.filter_map @@ begin fun switch ->
+        let images = List.filter_map (Switch_map.find_opt switch) ocaml_images in
+        if images = [] then None
+        else (
+          let full_tag = Tag.v distro ~switch in
+          let tags =
+            (* Push the image as e.g. windows-mingw-20H2-ocaml-4.09  *)
+            let tags = [full_tag] in
+            if switch <> Ocaml_version.Releases.latest then tags
+            else (
+              (* For every distro, also create a link to the latest OCaml compiler.
+                 e.g. windows-mingw-20H2 -> windows-mingw-20H2-ocaml-4.09 *)
+              Tag.v_alias distro :: tags
+            )
+          in
+          (* Fmt.pr "Aliases: %s -> %a@." full_tag Fmt.(Dump.list string) (List.sort String.compare tags); *)
+          let pushes = List.map (fun tag -> Current_docker.push_manifest ?auth:Conf.auth ~tag images |> Current.ignore_value) tags in
+          Some (Switch_map.add switch images Switch_map.empty, (full_tag, Current.all pushes))
+        )
+      end |> List.split
+    in
+    let archive_images =
+      match archive_image with
+      | None -> []
+      | Some image -> [ "archive", Current_docker.push_manifest ?auth:Conf.auth ~tag:(Tag.archive ()) [image] |> Current.ignore_value ]
+    in
+    let pipeline =
+      Current.all_labelled (
+          ("base", Current_docker.push_manifest ?auth:Conf.auth ~tag:(Tag.v distro) opam_images |> Current.ignore_value)
+          :: ocaml_images
+          @ archive_images)
+    in
+    let multiarch_images =
+      let update images = function None -> Some images | Some images' -> Some (images @ images') in (* FIXME: duplicates? *)
+      let fold switch images acc = Switch_map.update switch (update images) acc in
+      let fold_left acc images = Switch_map.fold fold acc images in
+      List.fold_left fold_left multiarches multiarch_images
+    in
+    (multiarch_images, pipeline)
+  in
+  let multiarch, pipelines = List.fold_left_map distro_pipeline Switch_map.empty distro_versions in
+  let pushes =
+    Switch_map.fold (fun switch images pushes ->
+        let full_tag = Fmt.str "%s:%s-ocaml-%s" Conf.public_repo distro_label (Tag.tag_of_compiler switch) in
+        let tags =
+          let tags = [full_tag] in
+          if switch <> Ocaml_version.Releases.latest then tags
+          else Fmt.str "%s:%s" Conf.public_repo distro_label :: tags
+        in
+        (* Fmt.pr "Aliases: %s -> %a@." full_tag Fmt.(Dump.list string) (List.sort String.compare tags); *)
+        let pushes' = List.map (fun tag -> Current_docker.push_manifest ?auth:Conf.auth ~tag images |> Current.ignore_value) tags in
+        (full_tag, Current.all pushes') :: pushes)
+      multiarch []
+  in
+  Current.(collapse ~key:"distro" ~value:distro_label ~input:repo (all ((all_labelled pushes) :: pipelines)))
+
+let windows_pipeline ~ocluster distros =
+  let mingw, msvc, cygwin = List.fold_left (fun (mingw, msvc, cygwin) d ->
+    match d with
+    | `Windows (`Mingw, _) -> (d :: mingw, msvc, cygwin)
+    | `Windows (`Msvc, _) -> (mingw, d :: msvc, cygwin)
+    | `Cygwin _ -> (mingw, msvc, d :: cygwin)
+    | _ -> assert false) ([], [], []) distros
+  in
+  List.( (filter_map (fun (os_family, distro_label, distros) ->
+      match distros with
+      | [] -> None
+      | distro_versions ->
+         let repo = label distro_label (opam_repository os_family) in
+         windows_distro_pipeline ~ocluster repo distro_label distro_versions |> Option.some)
+    [(`Windows, "windows-mingw", mingw); (`Windows, "windows-msvc", msvc); (`Cygwin, "cygwin", cygwin)]))
+
+(* The main pipeline. Builds images for all supported distribution, compiler version and architecture combinations. *)
+let v ?channel ~ocluster () =
+  Current.all (
+    let linux, windows = Conf.distros |> List.partition @@ fun d ->
+      match Dockerfile_distro.os_family_of_distro d with
+      | `Linux -> true | `Windows | `Cygwin -> false
+    in
+    List.map (linux_pipeline ~ocluster) linux @ windows_pipeline ~ocluster windows
+    )
   |> notify_status ?channel
