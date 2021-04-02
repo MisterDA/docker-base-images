@@ -58,25 +58,27 @@ let install_compiler_df ~os_family ~arch ~switch ?windows_port opam_image =
     | Some port -> Dockerfile_windows.ocaml_for_windows_package_exn ~switch ~arch ~port
   in
   let open Dockerfile in
-  let run, run_no_opam, depext =
+  let personality = Dockerfile_distro.personality os_family arch in
+  let run, run_no_opam, depext, etp_exec =
     let open Dockerfile_windows in
     let bitness = if Ocaml_version.arch_is_32bit arch then "--32" else "--64" in
     match windows_port with
     | None ->
-       (fun fmt -> run fmt), (fun fmt -> run fmt), "opam-depext"
+       (fun fmt -> run fmt), (fun fmt -> run fmt), "opam-depext", ["opam"; "exec"; "--"]
     | Some `Msvc ->
-       (fun fmt -> run_ocaml_env (bitness ^ " --ms=vs2019") fmt),
-       (fun fmt -> run_ocaml_env (bitness ^ " --ms=vs2019 --no-opam ") fmt),
-       "depext"
+       (fun fmt -> run_ocaml_env [bitness; "--ms=vs2019"] fmt),
+       (fun fmt -> run_ocaml_env [bitness; "--ms=vs2019"; "--no-opam"] fmt),
+       "depext", ["ocaml-env"; "exec"; bitness; "--ms=vs2019"; "--"]
     | Some `Mingw ->
-       (fun fmt -> run_ocaml_env bitness fmt),
-       (fun fmt -> run_ocaml_env (bitness ^ " --no-opam") fmt),
-       "depext depext-cygwinports"
+       (fun fmt -> run_ocaml_env [bitness] fmt),
+       (fun fmt -> run_ocaml_env [bitness; "--no-opam"] fmt),
+       "depext depext-cygwinports", ["ocaml-env"; "exec"; bitness; "--"]
   in
-  let additional_packages = Ocaml_version.Opam.V2.additional_packages switch in
-  let personality = Dockerfile_distro.personality os_family arch in
-  let shell = Option.fold ~none:empty ~some:(fun pers -> shell [pers; "/bin/sh"; "-c"]) personality in
-  let packages = String.concat "," (Printf.sprintf "%s.%s" package_name package_version :: additional_packages) in
+  let shell = maybe (fun pers -> shell [pers; "/bin/sh"; "-c"]) personality in
+  let packages =
+    let additional_packages = Ocaml_version.Opam.V2.additional_packages switch in
+    String.concat "," (Printf.sprintf "%s.%s" package_name package_version :: additional_packages)
+  in
   from opam_image @@
   shell @@
   maybe_add_beta run switch @@
@@ -91,8 +93,8 @@ let install_compiler_df ~os_family ~arch ~switch ?windows_port opam_image =
   run "opam install -y %s" depext @@
   run "opam pin add -k version %s %s" package_name package_version @@
   maybe_install_secondary_compiler run switch @@
-  entrypoint_exec (Option.to_list personality @ ["opam"; "exec"; "--"]) @@
-  match os_family with `Linux | `Cygwin -> cmd "bash" | `Windows -> cmd "CMD" @@
+  entrypoint_exec (Option.to_list personality @ etp_exec) @@
+  match os_family with `Linux | `Cygwin -> cmd "bash" | `Windows -> cmd_exec ["cmd.exe"] @@
   copy ~src:["Dockerfile"] ~dst:"/Dockerfile.ocaml" ()
 
 let or_die = function
