@@ -40,8 +40,9 @@ let pool_name os_family arch =
 
 let switches ~arch ~distro =
   let is_tier1 = List.mem distro (Dockerfile_distro.active_tier1_distros arch) in
+  let with_dev = match distro with `Windows _ -> false | _ -> true in
   let main_switches =
-    Ocaml_version.Releases.recent_with_dev
+    Ocaml_version.Releases.(if with_dev then recent_with_dev else recent)
     |> List.filter (fun ov -> Dockerfile_distro.distro_supported_on arch ov distro)
   in
   if is_tier1 then (
